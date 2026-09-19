@@ -43,6 +43,24 @@ def interpolate(t: float, t0: float, b0: float, t1: float, b1: float) -> float:
     return b0 + (b1 - b0) * (t - t0) / (t1 - t0)
 
 
+def exceedance_span(t0: float, b0: float, t1: float, b1: float, threshold: float) -> tuple[float, float] | None:
+    """线性段 (t0,b0)-(t1,b1) 内 bias > threshold 的连续子区间 [start, end]，无则 None。
+
+    恰一端越限时，另一端为解析交点 t* = t0 + (threshold − b0)·(t1 − t0)/(b1 − b0)。
+    恰好等于阈值不计入超限：交点本身不属于超限集，但它是零测度端点，仍作为闭区间
+    端点返回（不影响持续时长）。求 bias < −limit 的区间时，传入取负的端点偏差与
+    threshold=limit 即可。全程解析解，不做固定步长采样。
+    """
+    above0 = b0 > threshold
+    above1 = b1 > threshold
+    if above0 and above1:
+        return t0, t1
+    if not above0 and not above1:
+        return None
+    t_star = t0 + (threshold - b0) * (t1 - t0) / (b1 - b0)
+    return (t0, t_star) if above0 else (t_star, t1)
+
+
 def integrate_segment(t0: float, b0: float, t1: float, b1: float) -> tuple[float, float]:
     """对线性段 (t0, b0)-(t1, b1) 下的面积做解析积分，返回 (signed, absolute)。
 

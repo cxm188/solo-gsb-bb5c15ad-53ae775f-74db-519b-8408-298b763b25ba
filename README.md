@@ -24,6 +24,7 @@ SQLite 数据落在命名卷 `calibration-data`（容器内 `/data/calibration.d
 6. **覆盖范围**：查询时点超出 `[最早观测, 最晚观测]` 时拒绝（HTTP 400）；恰落在观测点上时直接使用该点偏差。
 7. **修订与版本**：观测带单调递增的 `revision`（新建为 1）。`PUT` 修订须携带当前 `revision`，版本过期或目标时点已被占用均返回 409；成功后观测 ID 不变、版本 +1，并保存一份修订前快照（旧输入与旧偏差），可通过修订历史接口按版本倒序查询。
 8. **累计漂移量**：`GET /drift-integral?from=&to=` 在覆盖范围内对当前分段线性 `bias` 做**解析积分**（精确梯形面积；段内 `bias` 过零时按解析交点拆分绝对值面积，不做固定步长采样），返回 `signed_bias_seconds`、`absolute_bias_seconds` 及按插值区间裁剪后的分段 `contributions`。窗口边界可落在区间内部；`from` 必须小于 `to`，任一边界越界返回 400。
+9. **漂移超限窗口分析**：`GET /drift-exceedances?from=&to=&limit=` 在覆盖范围内**解析求解**分段线性 `bias` 与 `±limit` 的交点，返回 `|bias| > limit` 的连续区间，每段含持续秒数、方向（`high`/`low`）与区间内峰值绝对偏差；跨观测点仍连续且同向的片段自动合并，恰好等于阈值不计入超限。`from ≥ to`、`limit ≤ 0` 或边界越界返回 400。
 
 ## API 一览
 
@@ -36,6 +37,7 @@ SQLite 数据落在命名卷 `calibration-data`（容器内 `/data/calibration.d
 | GET | `/intervals` | 列出当前插值区间 |
 | POST | `/corrections` | 对指定时点的读数做漂移补偿 |
 | GET | `/drift-integral` | 对覆盖范围内分段线性偏差做精确积分（累计漂移量） |
+| GET | `/drift-exceedances` | 解析求解 `|bias| > limit` 的连续超限区间（时长、方向、峰值） |
 | GET | `/health` | 健康检查 |
 
 时间戳支持 Unix 秒（数字）或 ISO 8601 字符串（如 `2026-09-18T08:00:00Z`），缺省为服务器当前时间。
@@ -170,11 +172,38 @@ curl "http://localhost:8000/drift-integral?from=2026-09-18T08:00:00Z&to=2026-09-
 
 若段内 `bias` 变号（如 `2.0 → −2.0`），`signed_bias_seconds` 中正负面积相互抵消（此处为 0），`absolute_bias_seconds` 则为零点两侧两个三角形面积之和（此处为 `7200.0`）。
 
+### 漂移超限窗口分析
+
+对 `[from, to]` 窗口内分段线性 `bias` 解析求解与 `±limit` 的交点，返回 `|bias| > limit` 的连续区间。窗口边界可落在区间内部（按插值裁剪）；跨观测点仍连续（交界点本身也超限）且方向相同的片段合并为一段；恰好等于阈值的时刻不计入超限。全程解析解，不做固定步长采样。
+
+```bash
+curl "http://localhost:8000/drift-exceedances?from=2026-09-18T08:00:00Z&to=2026-09-18T10:00:00Z&limit=2.0"
+```
+
+响应（沿用上文 08:00 `bias 1.0` → 10:00 `bias 3.0` 的区间，`bias` 在 09:00 处解析越过 `2.0`）：
+
+```json
+{
+  "from": 1789718400.0, "from_iso": "2026-09-18T08:00:00+00:00",
+  "to": 1789725600.0, "to_iso": "2026-09-18T10:00:00+00:00",
+  "limit": 2.0,
+  "exceedances": [
+    {"t_start": 1789722000.0, "t_end": 1789725600.0,
+     "start_iso": "2026-09-18T09:00:00+00:00", "end_iso": "2026-09-18T10:00:00+00:00",
+     "direction": "high", "duration_seconds": 3600.0,
+     "peak_abs_deviation": 3.0, "peak_at": 1789725600.0,
+     "peak_at_iso": "2026-09-18T10:00:00+00:00"}
+  ]
+}
+```
+
+每段字段：`direction` 为 `high`（`bias > limit`）或 `low`（`bias < −limit`）；`duration_seconds` 为该段持续秒数；`peak_abs_deviation` 与 `peak_at` 为区间内峰值绝对偏差及其时点（多处并列取最早）。窗口内从未超限时 `exceedances` 为空数组。
+
 ### 错误码
 
 | 状态码 | 场景 |
 | --- | --- |
-| 400 | 查询时点超出校准覆盖范围（响应含可用区间）；积分窗口 `from ≥ to` 或任一边界越界 |
+| 400 | 查询时点超出校准覆盖范围（响应含可用区间）；积分/超限窗口 `from ≥ to`、超限阈值 `limit ≤ 0` 或任一边界越界 |
 | 404 | 修订/查询修订历史时观测 ID 不存在 |
 | 409 | 同一时点重复登记观测；修订时版本过期或目标时点已被占用 |
 | 422 | 读数不足 3 次、全部读数被判异常、参数非法 |
@@ -194,8 +223,8 @@ uvicorn app.main:app --reload       # 本地启动（默认 ./calibration.db）
 ```
 app/
   main.py         # FastAPI 路由
-  service.py      # 观测入库、相邻区间重算、补偿查询、漂移积分
-  calibration.py  # 纯计算：异常判定、偏差、线性插值、分段积分
+  service.py      # 观测入库、相邻区间重算、补偿查询、漂移积分与超限分析
+  calibration.py  # 纯计算：异常判定、偏差、线性插值、分段积分、超限交点
   models.py       # Pydantic 请求/响应模型
   db.py           # SQLite 连接与建表
 tests/test_api.py # 端到端 API 测试

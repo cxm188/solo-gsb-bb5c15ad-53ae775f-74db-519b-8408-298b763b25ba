@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, BeforeValidator, Field
 
@@ -137,4 +137,27 @@ class DriftIntegralOut(BaseModel):
     absolute_bias_seconds: float = Field(description="窗口内偏差绝对值的积分（偏差·秒）")
     contributions: list[DriftContributionOut] = Field(
         description="按插值区间裁剪后的分段贡献，按时间排序；各分段面积之和等于汇总值"
+    )
+
+
+class DriftExceedanceOut(BaseModel):
+    t_start: float = Field(description="超限段起点（Unix 秒）：窗口/区间边界或 bias 与 ±limit 的解析交点")
+    t_end: float = Field(description="超限段终点（Unix 秒）")
+    start_iso: str
+    end_iso: str
+    direction: Literal["high", "low"] = Field(description="超限方向：high = bias > limit，low = bias < −limit")
+    duration_seconds: float = Field(description="该段持续秒数")
+    peak_abs_deviation: float = Field(description="区间内峰值绝对偏差 max|bias|")
+    peak_at: float = Field(description="峰值出现时点（Unix 秒）；多处并列时取最早")
+    peak_at_iso: str
+
+
+class DriftExceedancesOut(BaseModel):
+    from_: float = Field(alias="from", description="分析窗口下界（Unix 秒）")
+    from_iso: str
+    to: float = Field(description="分析窗口上界（Unix 秒）")
+    to_iso: str
+    limit: float = Field(description="超限阈值（正数）：|bias| 严格大于该值才算超限")
+    exceedances: list[DriftExceedanceOut] = Field(
+        description="|bias| > limit 的连续区间，按时间排序；跨观测点仍连续且同向的片段已合并"
     )

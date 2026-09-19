@@ -42,6 +42,10 @@ class InvalidWindowError(Exception):
     """积分窗口下界不小于上界。"""
 
 
+class InvalidLimitError(Exception):
+    """超限阈值不是正数。"""
+
+
 # ---------- 观测 ----------
 
 def create_observation(reference: float, tolerance: float, readings: list[float], ts: float) -> dict:
@@ -403,4 +407,101 @@ def drift_integral(frm: float, to: float) -> dict:
             "signed_bias_seconds": signed_total,
             "absolute_bias_seconds": absolute_total,
             "contributions": contributions,
+        }
+
+
+# ---------- 漂移超限窗口分析 ----------
+
+def drift_exceedances(frm: float, to: float, limit: float) -> dict:
+    """解析求解窗口 [frm, to] 内 |bias| > limit 的连续超限区间。
+
+    对每个插值区间解析求分段线性 bias 与 ±limit 的交点，得到超限子段
+    （恰好等于阈值不计入超限）；跨观测点仍连续（交界点本身也超限）且方向
+    相同的子段合并为一段。每段返回持续秒数、方向（high/low）与区间内峰值
+    绝对偏差及其时点。全程解析解，不做固定步长采样。
+    """
+    if not frm < to:
+        raise InvalidWindowError(f"from ({frm}) must be less than to ({to})")
+    if not limit > 0:
+        raise InvalidLimitError(f"limit ({limit}) must be positive")
+    with closing(connect()) as conn:
+        bounds = conn.execute("SELECT MIN(ts) AS lo, MAX(ts) AS hi FROM observations").fetchone()
+        lo, hi = bounds["lo"], bounds["hi"]
+        if lo is None:
+            raise OutOfCoverageError(frm, None, None)
+        if frm < lo:
+            raise OutOfCoverageError(frm, lo, hi)
+        if to > hi:
+            raise OutOfCoverageError(to, lo, hi)
+        rows = conn.execute(
+            "SELECT * FROM intervals WHERE t_start < ? AND t_end > ? ORDER BY t_start",
+            (to, frm),
+        ).fetchall()
+        exceedances = []
+        current = None  # 正在累积的连续超限段；遇到间断或换向时收尾
+        for row in rows:
+            a = max(frm, row["t_start"])   # 裁剪到查询窗口
+            b = min(to, row["t_end"])
+            if not a < b:
+                continue                   # 仅在端点相触，无时长
+            ba = calibration.interpolate(a, row["t_start"], row["bias_start"], row["t_end"], row["bias_end"])
+            bb = calibration.interpolate(b, row["t_start"], row["bias_start"], row["t_end"], row["bias_end"])
+            # 一段内高/低向至多各一个子段；按起点排序保证按时间顺序合并
+            spans = []
+            high = calibration.exceedance_span(a, ba, b, bb, limit)
+            if high is not None:
+                spans.append((high[0], high[1], "high"))
+            low = calibration.exceedance_span(a, -ba, b, -bb, limit)  # -bias > limit ⇔ bias < -limit
+            if low is not None:
+                spans.append((low[0], low[1], "low"))
+            spans.sort()
+            for p, q, direction in spans:
+                bp = calibration.interpolate(p, a, ba, b, bb)
+                bq = calibration.interpolate(q, a, ba, b, bb)
+                # 线性段上 |bias| 的峰值必在子段端点
+                peak_abs, peak_at = (abs(bp), p) if abs(bp) >= abs(bq) else (abs(bq), q)
+                if (
+                    current is not None
+                    and current["direction"] == direction
+                    and current["t_end"] == p      # 恰好跨观测点相接
+                    and abs(bp) > limit            # 交界点本身仍超限才算连续；恰等于阈值不计入
+                ):
+                    current["t_end"] = q
+                    current["duration_seconds"] += q - p
+                    if peak_abs > current["peak_abs_deviation"]:
+                        current["peak_abs_deviation"] = peak_abs
+                        current["peak_at"] = peak_at
+                else:
+                    if current is not None:
+                        exceedances.append(current)
+                    current = {
+                        "t_start": p,
+                        "t_end": q,
+                        "direction": direction,
+                        "duration_seconds": q - p,
+                        "peak_abs_deviation": peak_abs,
+                        "peak_at": peak_at,
+                    }
+        if current is not None:
+            exceedances.append(current)
+        return {
+            "from": frm,
+            "from_iso": epoch_to_iso(frm),
+            "to": to,
+            "to_iso": epoch_to_iso(to),
+            "limit": limit,
+            "exceedances": [
+                {
+                    "t_start": e["t_start"],
+                    "t_end": e["t_end"],
+                    "start_iso": epoch_to_iso(e["t_start"]),
+                    "end_iso": epoch_to_iso(e["t_end"]),
+                    "direction": e["direction"],
+                    "duration_seconds": e["duration_seconds"],
+                    "peak_abs_deviation": e["peak_abs_deviation"],
+                    "peak_at": e["peak_at"],
+                    "peak_at_iso": epoch_to_iso(e["peak_at"]),
+                }
+                for e in exceedances
+            ],
         }

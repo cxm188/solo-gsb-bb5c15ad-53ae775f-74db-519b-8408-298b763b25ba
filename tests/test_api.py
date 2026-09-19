@@ -393,3 +393,137 @@ def test_drift_integral_out_of_coverage_rejected(three_points):
 def test_drift_integral_without_any_observation_rejected(client):
     resp = client.get("/drift-integral", params={"from": 1.0, "to": 2.0})
     assert resp.status_code == 400
+
+
+# ---------- 漂移超限窗口分析 ----------
+
+def test_drift_exceedances_merges_across_observation_point(three_points):
+    # bias：1000→1.0，2000→3.0，3000→-1.0；limit=1
+    # 段1 在 t=1000 处恰等于阈值（不计入但为零测度端点），段2 在 t=2500 处解析交点回落到 1.0；
+    # 两段在观测点 t=2000（bias 3.0 仍超限）处连续且同向 → 合并为 [1000, 2500]
+    resp = three_points.get("/drift-exceedances", params={"from": 1000.0, "to": 3000.0, "limit": 1.0})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["from"] == pytest.approx(1000.0)
+    assert body["to"] == pytest.approx(3000.0)
+    assert body["limit"] == pytest.approx(1.0)
+    assert len(body["exceedances"]) == 1
+    exc = body["exceedances"][0]
+    assert exc["t_start"] == pytest.approx(1000.0)
+    assert exc["t_end"] == pytest.approx(2500.0)
+    assert exc["direction"] == "high"
+    assert exc["duration_seconds"] == pytest.approx(1500.0)
+    assert exc["peak_abs_deviation"] == pytest.approx(3.0)
+    assert exc["peak_at"] == pytest.approx(2000.0)
+    assert exc["start_iso"].startswith("1970-01-01T00:16:40")
+    assert exc["end_iso"].startswith("1970-01-01T00:41:40")
+    assert exc["peak_at_iso"].startswith("1970-01-01T00:33:20")
+
+
+def test_drift_exceedances_high_and_low_segments(three_points):
+    # limit=0.5：高向 [1000, 2625]（交点 2000 + (0.5-3)·1000/(-4)），低向 [2875, 3000]
+    body = three_points.get(
+        "/drift-exceedances", params={"from": 1000.0, "to": 3000.0, "limit": 0.5}
+    ).json()
+    assert [(e["t_start"], e["t_end"], e["direction"]) for e in body["exceedances"]] == [
+        (1000.0, 2625.0, "high"),
+        (2875.0, 3000.0, "low"),
+    ]
+    high, low = body["exceedances"]
+    assert high["duration_seconds"] == pytest.approx(1625.0)
+    assert high["peak_abs_deviation"] == pytest.approx(3.0)
+    assert high["peak_at"] == pytest.approx(2000.0)
+    assert low["duration_seconds"] == pytest.approx(125.0)
+    assert low["peak_abs_deviation"] == pytest.approx(1.0)   # 端点 3000 处 bias = -1.0
+    assert low["peak_at"] == pytest.approx(3000.0)
+
+
+def test_drift_exceedances_clips_window_inside_intervals(three_points):
+    # 窗口 [1500, 2800] 落在区间内部：高向 [1500, 2500]，bias(2800)=-0.2 未低向超限
+    body = three_points.get(
+        "/drift-exceedances", params={"from": 1500.0, "to": 2800.0, "limit": 1.0}
+    ).json()
+    assert len(body["exceedances"]) == 1
+    exc = body["exceedances"][0]
+    assert exc["t_start"] == pytest.approx(1500.0)
+    assert exc["t_end"] == pytest.approx(2500.0)
+    assert exc["duration_seconds"] == pytest.approx(1000.0)
+    assert exc["peak_abs_deviation"] == pytest.approx(3.0)
+
+
+def test_drift_exceedances_exact_threshold_touch_does_not_merge(client):
+    # bias：1000→2.0，2000→1.0，3000→2.0；limit=1
+    # 观测点 t=2000 处 bias 恰等于阈值，不计入超限 → 两侧不连续，不得合并
+    make_observation(client, 1000.0, 10.0, 0.5, [8.0, 8.1, 7.9])
+    make_observation(client, 2000.0, 10.0, 0.5, [9.0, 9.1, 8.9])
+    make_observation(client, 3000.0, 10.0, 0.5, [8.0, 8.1, 7.9])
+    body = client.get("/drift-exceedances", params={"from": 1000.0, "to": 3000.0, "limit": 1.0}).json()
+    assert [(e["t_start"], e["t_end"]) for e in body["exceedances"]] == [
+        (1000.0, 2000.0),
+        (2000.0, 3000.0),
+    ]
+    for exc in body["exceedances"]:
+        assert exc["direction"] == "high"
+        assert exc["duration_seconds"] == pytest.approx(1000.0)
+        assert exc["peak_abs_deviation"] == pytest.approx(2.0)
+
+
+def test_drift_exceedances_empty_when_never_exceeding(three_points):
+    body = three_points.get(
+        "/drift-exceedances", params={"from": 1000.0, "to": 3000.0, "limit": 5.0}
+    ).json()
+    assert body["exceedances"] == []
+
+
+def test_drift_exceedances_single_segment_crossing_both_directions(client):
+    # 两点 bias 5.0 → -5.0，limit=1：一段内先后产生高向与低向超限，按时间排序
+    make_observation(client, 1000.0, 10.0, 0.5, [5.0, 5.1, 4.9])
+    make_observation(client, 2000.0, 10.0, 0.5, [15.0, 15.1, 14.9])
+    body = client.get("/drift-exceedances", params={"from": 1000.0, "to": 2000.0, "limit": 1.0}).json()
+    # 高向 [1000, 1400]（交点 1000 + (1-5)·1000/(-10)），低向 [1600, 2000]
+    assert [(e["t_start"], e["t_end"], e["direction"]) for e in body["exceedances"]] == [
+        (1000.0, 1400.0, "high"),
+        (1600.0, 2000.0, "low"),
+    ]
+    assert body["exceedances"][0]["peak_abs_deviation"] == pytest.approx(5.0)
+    assert body["exceedances"][1]["peak_abs_deviation"] == pytest.approx(5.0)
+
+
+def test_drift_exceedances_accepts_iso8601_bounds(two_points):
+    resp = two_points.get(
+        "/drift-exceedances",
+        params={"from": "1970-01-01T00:16:40Z", "to": "1970-01-01T00:33:20Z", "limit": 1.5},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # bias 1.0 → 3.0，交点 t* = 1000 + (1.5-1)·1000/2 = 1250
+    assert [(e["t_start"], e["t_end"]) for e in body["exceedances"]] == [(1250.0, 2000.0)]
+    assert body["exceedances"][0]["duration_seconds"] == pytest.approx(750.0)
+
+
+def test_drift_exceedances_rejects_inverted_or_empty_window(three_points):
+    for params in ({"from": 2000.0, "to": 2000.0, "limit": 1.0},
+                   {"from": 3000.0, "to": 1000.0, "limit": 1.0}):
+        resp = three_points.get("/drift-exceedances", params=params)
+        assert resp.status_code == 400
+        assert "must be less than" in resp.json()["detail"]
+
+
+def test_drift_exceedances_rejects_non_positive_limit(three_points):
+    for limit in (0.0, -1.0):
+        resp = three_points.get("/drift-exceedances", params={"from": 1000.0, "to": 3000.0, "limit": limit})
+        assert resp.status_code == 400
+        assert "must be positive" in resp.json()["detail"]
+
+
+def test_drift_exceedances_out_of_coverage_rejected(three_points):
+    for params in ({"from": 999.0, "to": 2000.0, "limit": 1.0},
+                   {"from": 2000.0, "to": 3001.0, "limit": 1.0}):
+        resp = three_points.get("/drift-exceedances", params=params)
+        assert resp.status_code == 400
+        assert "outside calibration coverage" in resp.json()["detail"]
+
+
+def test_drift_exceedances_without_any_observation_rejected(client):
+    resp = client.get("/drift-exceedances", params={"from": 1.0, "to": 2.0, "limit": 1.0})
+    assert resp.status_code == 400

@@ -12,6 +12,7 @@ from .db import init_db
 from .models import (
     CorrectionIn,
     CorrectionOut,
+    DriftExceedancesOut,
     DriftIntegralOut,
     IntervalOut,
     ObservationIn,
@@ -22,6 +23,7 @@ from .models import (
 )
 from .service import (
     DuplicateTimestampError,
+    InvalidLimitError,
     InvalidWindowError,
     ObservationNotFoundError,
     OutOfCoverageError,
@@ -135,4 +137,22 @@ def get_drift_integral(
     try:
         return service.drift_integral(frm=from_, to=to)
     except (InvalidWindowError, OutOfCoverageError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/drift-exceedances", response_model=DriftExceedancesOut)
+def get_drift_exceedances(
+    from_: Annotated[Timestamp, Query(alias="from", description="分析窗口下界：Unix 秒或 ISO 8601")],
+    to: Annotated[Timestamp, Query(description="分析窗口上界：Unix 秒或 ISO 8601")],
+    limit: Annotated[float, Query(description="超限阈值（正数）：|bias| 严格大于该值即判超限")],
+) -> dict:
+    """解析求解窗口内 |bias| > limit 的连续超限区间。
+
+    对每个插值区间解析求分段线性 bias 与 ±limit 的交点（无固定步长采样）；
+    跨观测点仍连续且同向的片段合并为一段，恰好等于阈值不计入超限。
+    每段返回起止时间、持续秒数、方向（high/low）与区间内峰值绝对偏差。
+    """
+    try:
+        return service.drift_exceedances(frm=from_, to=to, limit=limit)
+    except (InvalidWindowError, InvalidLimitError, OutOfCoverageError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
