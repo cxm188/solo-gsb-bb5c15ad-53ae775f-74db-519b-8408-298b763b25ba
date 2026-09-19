@@ -42,6 +42,10 @@ class InvalidWindowError(Exception):
     """积分窗口下界不小于上界。"""
 
 
+class InvalidLimitError(Exception):
+    """超限阈值不是正数。"""
+
+
 # ---------- 观测 ----------
 
 def create_observation(reference: float, tolerance: float, readings: list[float], ts: float) -> dict:
@@ -404,3 +408,92 @@ def drift_integral(frm: float, to: float) -> dict:
             "absolute_bias_seconds": absolute_total,
             "contributions": contributions,
         }
+
+
+# ---------- 漂移超限窗口分析 ----------
+
+def drift_exceedances(frm: float, to: float, limit: float) -> dict:
+    """在窗口 [frm, to] 内解析求解分段线性 bias 越出 ±limit 的连续区间。
+
+    逐插值区间求 bias 与 ±limit 的解析交点（禁止固定步长采样），把跨观测点
+    仍连续且同向的片段合并为一段；恰等于 limit 的瞬时不计入超限（观测点恰好
+    触及阈值时两侧不合并）。每段给出方向、持续秒数与区间内 |bias| 峰值。
+    """
+    if not frm < to:
+        raise InvalidWindowError(f"from ({frm}) must be less than to ({to})")
+    if not limit > 0:  # 同时拒绝 NaN
+        raise InvalidLimitError(f"limit ({limit}) must be positive")
+    with closing(connect()) as conn:
+        bounds = conn.execute("SELECT MIN(ts) AS lo, MAX(ts) AS hi FROM observations").fetchone()
+        lo, hi = bounds["lo"], bounds["hi"]
+        if lo is None:
+            raise OutOfCoverageError(frm, None, None)
+        if frm < lo:
+            raise OutOfCoverageError(frm, lo, hi)
+        if to > hi:
+            raise OutOfCoverageError(to, lo, hi)
+        rows = conn.execute(
+            "SELECT * FROM intervals WHERE t_start < ? AND t_end > ? ORDER BY t_start",
+            (to, frm),
+        ).fetchall()
+        merged: list[dict] = []
+        for row in rows:
+            a = max(frm, row["t_start"])   # 裁剪到查询窗口
+            b = min(to, row["t_end"])
+            if not a < b:
+                continue                   # 仅在端点相触，时长为零
+            ba = calibration.interpolate(a, row["t_start"], row["bias_start"], row["t_end"], row["bias_end"])
+            bb = calibration.interpolate(b, row["t_start"], row["bias_start"], row["t_end"], row["bias_end"])
+            for s, e, direction in calibration.exceedance_subranges(a, ba, b, bb, limit):
+                bs = calibration.interpolate(s, a, ba, b, bb)
+                be = calibration.interpolate(e, a, ba, b, bb)
+                peak = max(abs(bs), abs(be))  # 子区间内 |bias| 仍是线性，峰值必在端点
+                _merge_or_append(merged, s, e, direction, peak,
+                                 junction_bias=ba if s == a else None, limit=limit)
+        exceedances = [
+            {
+                "t_start": m["t_start"],
+                "t_end": m["t_end"],
+                "start_iso": epoch_to_iso(m["t_start"]),
+                "end_iso": epoch_to_iso(m["t_end"]),
+                "direction": m["direction"],
+                "duration_seconds": m["t_end"] - m["t_start"],
+                "peak_abs_deviation": m["peak_abs_deviation"],
+            }
+            for m in merged
+        ]
+        return {
+            "from": frm,
+            "from_iso": epoch_to_iso(frm),
+            "to": to,
+            "to_iso": epoch_to_iso(to),
+            "limit": limit,
+            "exceedances": exceedances,
+        }
+
+
+def _merge_or_append(
+    merged: list[dict],
+    s: float,
+    e: float,
+    direction: str,
+    peak: float,
+    junction_bias: float | None,
+    limit: float,
+) -> None:
+    """把超限片段并入结果：与上一段首尾相接、同向且衔接点仍严格越限时合并。
+
+    衔接点即当前裁剪段起点（观测点或窗口边界）；仅当它本身 |bias| > limit 时
+    超限才真正连续。观测点恰好等于 ±limit 时该瞬时不算超限，两侧保持为两段。
+    """
+    if (
+        merged
+        and merged[-1]["direction"] == direction
+        and merged[-1]["t_end"] == s
+        and junction_bias is not None
+        and abs(junction_bias) > limit
+    ):
+        merged[-1]["t_end"] = e
+        merged[-1]["peak_abs_deviation"] = max(merged[-1]["peak_abs_deviation"], peak)
+        return
+    merged.append({"t_start": s, "t_end": e, "direction": direction, "peak_abs_deviation": peak})

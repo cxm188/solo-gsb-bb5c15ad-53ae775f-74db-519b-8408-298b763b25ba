@@ -138,3 +138,24 @@ class DriftIntegralOut(BaseModel):
     contributions: list[DriftContributionOut] = Field(
         description="按插值区间裁剪后的分段贡献，按时间排序；各分段面积之和等于汇总值"
     )
+
+
+class ExceedanceOut(BaseModel):
+    t_start: float = Field(description="超限区间起点（Unix 秒）：解析交点或窗口边界")
+    t_end: float = Field(description="超限区间终点（Unix 秒）")
+    start_iso: str
+    end_iso: str
+    direction: str = Field(description="超限方向：high = bias > limit；low = bias < −limit")
+    duration_seconds: float = Field(description="超限持续秒数（t_end − t_start）")
+    peak_abs_deviation: float = Field(description="区间内 |bias| 的峰值")
+
+
+class DriftExceedancesOut(BaseModel):
+    from_: float = Field(alias="from", description="分析窗口下界（Unix 秒）")
+    from_iso: str
+    to: float = Field(description="分析窗口上界（Unix 秒）")
+    to_iso: str
+    limit: float = Field(description="超限阈值（正数）：|bias| 严格大于该值才计为超限")
+    exceedances: list[ExceedanceOut] = Field(
+        description="|bias| > limit 的连续区间，按时间排序；跨观测点仍连续且同向的片段已合并"
+    )
